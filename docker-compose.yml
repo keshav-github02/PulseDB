@@ -1,0 +1,25 @@
+# Build and run the PulseDB server:  docker compose up --build
+# Ingestion on :8080, metrics API on :8081.
+services:
+  pulsedb:
+    build: .
+    image: pulsedb:latest
+    container_name: pulsedb
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    restart: unless-stopped
+    volumes:
+      # snapshot_path is "data/metrics.json", relative to WORKDIR /app. Without
+      # this the snapshot lives in the container's writable layer, so it survives
+      # a restart but is destroyed by `docker compose up --build` -- which is the
+      # command in the README, making persistence look broken when it is not.
+      - pulsedb-data:/app/data
+    # Minute buckets are never evicted, so resident memory grows with uptime (see
+    # the README's "Known gaps"). This cap turns that from "eventually takes the
+    # host down" into "this container restarts", which is the better failure until
+    # retention exists. Raise it for deliberately long-running deployments.
+    mem_limit: 2g
+
+volumes:
+  pulsedb-data:

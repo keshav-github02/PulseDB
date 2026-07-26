@@ -1,0 +1,9 @@
+{
+  "queue_size": 100000,
+  "workers": 8,
+  "host": "0.0.0.0",
+  "port": 8080,
+  "query_port": 8081,
+  "snapshot_path": "data/metrics.json",
+  "snapshot_interval_sec": 10
+}

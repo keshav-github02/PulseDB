@@ -1,0 +1,77 @@
+# --- Build output ----------------------------------------------------------
+build/
+out/
+# CLion / Visual Studio default out-of-source build directories.
+cmake-build-*/
+# Local CMake presets carry absolute toolchain paths, so they are per-machine.
+CMakeUserPresets.json
+# CTest output when ctest is run from the repo root rather than build/.
+Testing/
+# clangd / IDE index and the compile database generated for it.
+compile_commands.json
+.cache/
+
+# Compiled objects, libraries and binaries.
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.dll
+*.so
+*.so.*
+*.dylib
+*.pdb
+*.ilk
+*.exp
+
+# --- Secrets and local configuration ---------------------------------------
+# The dashboard reads VITE_API_BASE from the environment, and Vite loads .env
+# files automatically -- so a stray .env is the easiest way to publish something
+# that was never meant to be public. Never track them; commit a .env.example
+# with placeholder values instead.
+.env
+.env.*
+!.env.example
+
+# --- Dashboard (Node / Vite) -----------------------------------------------
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Runtime data ----------------------------------------------------------
+# Server metrics snapshots (snapshot_path) and the SDK's offline event spool
+# (--spool-dir). Both are local state written at run time and recreated on
+# demand, so they must never be committed -- a checked-in snapshot would be
+# restored additively on top of live counters on someone else's machine.
+data/
+spool/
+
+# --- Crash artifacts -------------------------------------------------------
+# Deliberately NOT a bare `core`: that pattern matches directories too, so it
+# silently swallows this repo's own core/ module and every new file added to it.
+# Modern kernels name dumps core.<pid> (or hand them to systemd-coredump), so
+# the suffixed forms are what actually appear.
+*.stackdump
+core.[0-9]*
+vgcore.*
+
+# --- IDE / editor ----------------------------------------------------------
+.vscode/
+.idea/
+.vs/
+*.user
+*.suo
+*.swp
+*~
+
+# --- OS noise --------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+._*
+.AppleDouble

@@ -1,0 +1,11 @@
+# Normalize line endings: store and check out text as LF everywhere.
+# eol=lf overrides a global core.autocrlf=true, so Git stops rewriting
+# endings and the "LF will be replaced by CRLF" warnings go away.
+* text=auto eol=lf
+
+# Binary assets: never normalize.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary

@@ -266,20 +266,3 @@ Target resume bullets:
     event volumes.
 
 ------------------------------------------------------------------------
-
-# IMPORTANT IMPLEMENTATION GUIDELINES FOR CLAUDE
-
-1.  Do NOT generate everything at once.
-2.  Implement one module per iteration.
-3.  Keep modules loosely coupled.
-4.  Use interfaces and dependency injection where appropriate.
-5.  Prefer composition over inheritance.
-6.  Follow modern C++20 best practices.
-7.  Add unit tests for every module.
-8.  Document every public class.
-9.  Use meaningful commit-sized implementations.
-10. Prioritize readability over cleverness.
-
-This specification is intentionally architecture-first. The
-implementation should reflect production-quality software engineering
-rather than tutorial-style code.

@@ -8,7 +8,7 @@ on:
   # it, pushing a feature branch runs nothing at all (the push trigger is
   # main-only and there is no PR yet), which reads as "CI is broken" on a freshly
   # pushed repo rather than "CI has nothing to do".
-  workflow_dispatch::
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref.
 concurrency:

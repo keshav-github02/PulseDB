@@ -9,6 +9,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "pulsedb/core/event_type.hpp"
+
 namespace pulsedb::collector {
 namespace {
 
@@ -145,13 +147,33 @@ IngestResult IngestHandler::handle(std::string_view body,
         if (!event.is_object()) {
             return reject(IngestStatus::kInvalidSchema, at + " is not an object");
         }
-        if (options_.require_event_type) {
-            const auto it = event.find("event_type");
-            if (it == event.end() || !it->is_string() ||
-                it->get_ref<const std::string&>().empty()) {
+        // The event type must not merely be present -- it must name a type the
+        // pipeline can actually fold into a metric.
+        //
+        // Presence alone was the whole check, and that made the 202 a lie: an
+        // unrecognised type passed ingest, then parse_event() returned nullopt in
+        // the worker and the event was counted as a parse failure and dropped. The
+        // client was told "accepted" for data that was silently thrown away, which
+        // is the worst of both worlds -- no data and no error. A typo'd or
+        // version-skewed event type is exactly the case that needs to be loud,
+        // because the sender is the only party that can fix it.
+        //
+        // Validating here rather than in the worker keeps the rejection
+        // synchronous, so it can still be answered with a 422.
+        if (const auto it = event.find("event_type"); it != event.end()) {
+            if (!it->is_string() || it->get_ref<const std::string&>().empty()) {
                 return reject(IngestStatus::kInvalidSchema,
                               at + " is missing a non-empty string \"event_type\"");
             }
+            const std::string& name = it->get_ref<const std::string&>();
+            if (!core::event_type_from_string(name)) {
+                return reject(IngestStatus::kInvalidSchema,
+                              at + " has unrecognised \"event_type\" \"" + name +
+                                  "\"; the event would be accepted and then dropped");
+            }
+        } else if (options_.require_event_type) {
+            return reject(IngestStatus::kInvalidSchema,
+                          at + " is missing a non-empty string \"event_type\"");
         }
 
         // Timestamps address a permanent minute bucket, so they are validated

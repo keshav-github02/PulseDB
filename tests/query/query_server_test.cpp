@@ -4,7 +4,9 @@
 #include <httplib.h>
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -100,10 +102,73 @@ TEST_F(QueryServerTest, RangeRequiresBounds) {
     ASSERT_TRUE(bad);
     EXPECT_EQ(bad->status, 400);
 
-    const auto ok = client_->Get("/metrics/range?from=0&to=9999999999999");
+    // A window around the two seeded buckets, narrow enough to sit inside
+    // max_response_minutes (this used to span the entire epoch).
+    const auto ok = client_->Get("/metrics/range?from=" +
+                                 std::to_string(kMinuteA - 60'000) + "&to=" +
+                                 std::to_string(kMinuteA + 120'000));
     ASSERT_TRUE(ok);
     EXPECT_EQ(ok->status, 200);
     EXPECT_EQ(nlohmann::json::parse(ok->body)["minutes"].size(), 2u);
+}
+
+// --- Response-size bounds ---------------------------------------------------
+// Both read endpoints accepted an unbounded window, so a single ~60-byte
+// unauthenticated GET could ask the server to serialise every bucket it holds
+// -- while holding the store mutex that the ingest path also needs.
+
+TEST_F(QueryServerTest, LiveClampsAnAbsurdMinutesParameter) {
+    // The request is answered (it is still "the most recent N"), just capped.
+    const auto res = client_->Get("/metrics/live?minutes=999999999");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+    const auto j = nlohmann::json::parse(res->body);
+    EXPECT_EQ(j["minutes"].size(), 2u) << "only two buckets exist to return";
+}
+
+TEST_F(QueryServerTest, LiveNeverReturnsMoreThanTheConfiguredCap) {
+    // Seed more buckets than the cap allows, then confirm the reply is bounded
+    // by the cap and not by what the client asked for.
+    QueryServer::Config cfg;
+    cfg.host = "127.0.0.1";
+    cfg.max_response_minutes = 5;
+
+    AggregationEngine engine;
+    for (int i = 0; i < 40; ++i) {
+        engine.process(view(kMinuteA + static_cast<std::int64_t>(i) * 60'000, "P", "D"));
+    }
+
+    QueryServer server{cfg, engine};
+    const int port = server.bind_to_any_port();
+    ASSERT_GT(port, 0);
+    std::thread t([&server] { server.listen_after_bind(); });
+    for (int i = 0; i < 200 && !server.is_running(); ++i) {
+        std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_TRUE(server.is_running());
+
+    httplib::Client client("127.0.0.1", port);
+    const auto res = client.Get("/metrics/live?minutes=999999999");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+    EXPECT_EQ(nlohmann::json::parse(res->body)["minutes"].size(), 5u);
+
+    server.stop();
+    if (t.joinable()) {
+        t.join();
+    }
+}
+
+TEST_F(QueryServerTest, RangeRejectsAWindowOverTheCap) {
+    // Rejected rather than truncated: a partial slice would read as "these are
+    // all the buckets in that window".
+    const auto res = client_->Get("/metrics/range?from=0&to=253402300799999");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400);
+    const auto body = nlohmann::json::parse(res->body);
+    ASSERT_TRUE(body.contains("error"));
+    EXPECT_NE(body["error"].get<std::string>().find("narrower"), std::string::npos)
+        << body["error"];
 }
 
 }  // namespace

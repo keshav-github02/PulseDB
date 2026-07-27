@@ -2,7 +2,9 @@
 
 #include <httplib.h>
 
+#include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -77,7 +79,11 @@ struct QueryServer::Impl {
                     minutes = static_cast<std::size_t>(*n);
                 }
             }
-            write_json(res, api.live(minutes));
+            // Clamp rather than reject: `minutes` is a "give me the most recent N"
+            // hint, so silently capping it still answers the question asked, just
+            // truncated. An uncapped value let one request serialise the whole
+            // store (see Config::max_response_minutes).
+            write_json(res, api.live(std::min(minutes, config.max_response_minutes)));
         });
 
         server.Get("/metrics/range", [this](const httplib::Request& req, httplib::Response& res) {
@@ -114,6 +120,25 @@ struct QueryServer::Impl {
             }
             if (*from > *to) {
                 write_json(res, {{"error", "'from' must not be greater than 'to'"}}, 400);
+                return;
+            }
+            // A window is rejected rather than clamped, unlike /metrics/live: there
+            // is no truncation of [from, to] that is still the answer to the
+            // question, and quietly returning a slice of the requested range would
+            // read as "these are all the buckets in that window". Paging is the
+            // caller's decision, so tell them the limit and let them make it.
+            //
+            // Computed in minutes on int64 (both bounds are already known to be
+            // inside the representable domain, so the subtraction cannot overflow).
+            const std::int64_t span_minutes = (*to - *from) / 60'000 + 1;
+            if (span_minutes > static_cast<std::int64_t>(config.max_response_minutes)) {
+                write_json(res,
+                           {{"error", "requested window spans " +
+                                          std::to_string(span_minutes) +
+                                          " minutes, over the " +
+                                          std::to_string(config.max_response_minutes) +
+                                          "-minute limit; request a narrower range"}},
+                           400);
                 return;
             }
             write_json(res, api.range(*from, *to));

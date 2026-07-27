@@ -62,7 +62,10 @@ TEST(IngestHandlerTest, RejectsEmptyBatch) {
 }
 
 TEST(IngestHandlerTest, RejectsNonObjectEvent) {
-    const auto r = run(R"([{"event_type":"a"}, 42])");
+    // The first event carries a *valid* type so the rejection can only be caused
+    // by the bare 42 -- otherwise the unrecognised-type check fires at index 0
+    // and this passes without ever exercising the non-object path.
+    const auto r = run(R"([{"event_type":"seek"}, 42])");
     EXPECT_EQ(r.status, IngestStatus::kInvalidSchema);
 }
 
@@ -86,8 +89,10 @@ TEST(IngestHandlerTest, AllowsMissingEventTypeWhenNotRequired) {
 TEST(IngestHandlerTest, RejectsBatchOverConfiguredLimit) {
     IngestOptions opts;
     opts.max_events_per_batch = 2;
-    const auto r =
-        run(R"([{"event_type":"a"},{"event_type":"b"},{"event_type":"c"}])", opts);
+    // Valid event types, so this tests the count cap rather than accidentally
+    // depending on the per-event checks running first.
+    const auto r = run(
+        R"([{"event_type":"pause"},{"event_type":"resume"},{"event_type":"seek"}])", opts);
     EXPECT_EQ(r.status, IngestStatus::kInvalidSchema);
 }
 
@@ -289,6 +294,51 @@ TEST(IngestHandlerTest, IgnoresNumericFieldsIrrelevantToTheEventType) {
     // is still validated -- but an absent one is simply not checked.
     EXPECT_EQ(run(R"([{"event_type":"seek","seek_to_ms":123456}])").status,
               IngestStatus::kAccepted);
+}
+
+// --- Event-type whitelist ---------------------------------------------------
+// Presence used to be the entire check, so an unrecognised type was answered
+// with 202 and then dropped by the worker as a parse failure: the client was
+// told its data was accepted while it was in fact discarded.
+
+TEST(IngestHandlerTest, RejectsUnrecognisedEventType) {
+    const auto r = run(R"([{"event_type":"not_a_real_event_type","session_id":"s1"}])");
+    EXPECT_EQ(r.status, IngestStatus::kInvalidSchema);
+    EXPECT_FALSE(r.batch.has_value());
+    EXPECT_NE(r.message.find("not_a_real_event_type"), std::string::npos)
+        << "the rejection must name the offending type so the sender can fix it: "
+        << r.message;
+}
+
+TEST(IngestHandlerTest, RejectsUnrecognisedEventTypeAnywhereInTheBatch) {
+    // A single bad event must not ride in on the back of valid ones.
+    const auto r = run(R"([{"event_type":"video_start"},
+                           {"event_type":"vidoe_start"},
+                           {"event_type":"playback_end"}])");
+    EXPECT_EQ(r.status, IngestStatus::kInvalidSchema);
+    EXPECT_NE(r.message.find("index 1"), std::string::npos) << r.message;
+}
+
+TEST(IngestHandlerTest, RejectsUnrecognisedEventTypeEvenWhenNotRequired) {
+    // require_event_type governs whether the field may be *absent*. It does not
+    // license a present-but-meaningless value, which would still be dropped
+    // downstream.
+    IngestOptions opts;
+    opts.require_event_type = false;
+    EXPECT_EQ(run(R"([{"event_type":"bogus"}])", opts).status,
+              IngestStatus::kInvalidSchema);
+    EXPECT_EQ(run(R"([{"session_id":"s1"}])", opts).status, IngestStatus::kAccepted);
+}
+
+TEST(IngestHandlerTest, AcceptsEveryKnownEventType) {
+    // Guards against the whitelist and the enum drifting apart: a type the
+    // pipeline understands must never be rejected at the door.
+    for (const char* type : {"video_start", "startup_complete", "buffer_start",
+                             "buffer_end", "pause", "resume", "seek",
+                             "bitrate_change", "drm_error", "playback_end"}) {
+        const auto body = std::string(R"([{"event_type":")") + type + R"("}])";
+        EXPECT_EQ(run(body).status, IngestStatus::kAccepted) << type;
+    }
 }
 
 }  // namespace

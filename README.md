@@ -109,9 +109,16 @@ curl -X POST http://127.0.0.1:8080/v1/events -H "Content-Type: application/json"
 ```
 
 Responses: `202` accepted, `400` malformed JSON, `413` body over
-`max_body_bytes`, `422` bad schema (including an out-of-window timestamp or an
-over-long label), `503` when the queue is saturated (clients should retry with
-backoff).
+`max_body_bytes`, `422` bad schema (including an unrecognised `event_type`, an
+out-of-window timestamp, or an over-long label), `503` when the queue is
+saturated (clients should retry with backoff).
+
+`event_type` is checked against the ten types the pipeline understands, not just
+for presence. Presence alone was the whole check, and that made the `202` a lie:
+an unrecognised type was accepted, then discarded by the worker as a parse
+failure, so the client was told its data was stored when it had been thrown
+away — no data and no error. A typo'd or version-skewed type is precisely the
+case that has to be loud, because only the sender can fix it.
 
 ### Ingest limits
 
@@ -202,11 +209,27 @@ state and is not done.
 | Endpoint | Returns |
 | --- | --- |
 | `GET /metrics` | Platform-wide totals + minute-bucket count |
-| `GET /metrics/live?minutes=N` | The N most recent per-minute buckets |
-| `GET /metrics/range?from=<ms>&to=<ms>` | Buckets within an epoch-ms window |
+| `GET /metrics/live?minutes=N` | The N most recent per-minute buckets (N clamped to `max_response_minutes`) |
+| `GET /metrics/range?from=<ms>&to=<ms>` | Buckets within an epoch-ms window (`400` if the window exceeds `max_response_minutes`) |
 | `GET /metrics/player` | Per-player metric breakdown |
 | `GET /metrics/device` | Per-device metric breakdown |
 | `GET /status` | Live operational metrics: events/sec, queue depth, active sessions, error rate, CPU %, memory, uptime |
+
+#### Response-size bound
+
+Both bucket endpoints took an unbounded window, so one short unauthenticated GET
+could ask the server to serialise its entire store — measured at 5,000 buckets,
+`?minutes=999999999` turned a ~60-byte request into a **1.25 MB** response
+(~20,000x amplification), holding the store mutex the ingest path also needs for
+the whole traversal. Since buckets are never evicted, that grew with uptime.
+
+`QueryServer::Config::max_response_minutes` (default **1,440** — a day of
+minutes) now bounds it: `/metrics/live` clamps `minutes`, and `/metrics/range`
+rejects an over-wide window with `400` rather than truncating, because a partial
+slice would read as "these are all the buckets in that window". The shipped
+dashboard asks for 15, so nothing legitimate is affected. Note this bounds the
+*response*, not the *work* — `recent`/`range` still traverse every bucket (see
+"Known gaps"), and the port still has **no authentication and no rate limiting**.
 
 ```powershell
 curl.exe http://127.0.0.1:8081/metrics

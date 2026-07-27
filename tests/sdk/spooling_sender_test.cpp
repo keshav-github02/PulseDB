@@ -40,6 +40,21 @@ public:
     int sends = 0;
 };
 
+// A sink that always answers with one fixed status, to pin down which statuses
+// cause a batch to be kept versus destroyed.
+class FixedStatusSink : public EventSink {
+public:
+    explicit FixedStatusSink(int status) : status_(status) {}
+    SendResult send(const nlohmann::json&) override {
+        ++sends;
+        return SendResult::failure(status_, "fixed");
+    }
+    int sends = 0;
+
+private:
+    int status_;
+};
+
 nlohmann::json batch(const std::string& id) {
     return nlohmann::json::array({{{"event_type", "video_start"}, {"session_id", id}}});
 }
@@ -72,6 +87,52 @@ TEST_F(SpoolingSenderTest, SpoolsWhenOffline) {
     EXPECT_FALSE(result.ok);
     EXPECT_EQ(sender.spooled_count(), 1u);
     EXPECT_EQ(spool.count(), 1u);
+}
+
+TEST_F(SpoolingSenderTest, DoesNotSpoolAPermanentlyRejectedBatch) {
+    // 422 means the payload itself is unacceptable, so no retry can deliver it.
+    // Spooling it only to have replay() discard it on the same verdict wastes a
+    // capped slot.
+    FixedStatusSink rejected{422};
+    SpoolStore spool{dir_};
+    SpoolingSender sender{rejected, spool};
+
+    const auto result = sender.send(batch("bad"));
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(sender.spooled_count(), 0u);
+    EXPECT_EQ(sender.discarded_count(), 1u);
+    EXPECT_EQ(spool.count(), 0u) << "nothing undeliverable should reach disk";
+}
+
+TEST_F(SpoolingSenderTest, RejectedBatchesDoNotEvictRecoverableOnes) {
+    // The consequence that makes this a bug and not just waste: the spool is
+    // bounded and evicts oldest-first, so undeliverable batches displace ones
+    // that were merely offline. A client with a schema bug destroys its own
+    // recoverable backlog.
+    SpoolStore spool{dir_, /*max_batches=*/2};
+
+    ToggleSink offline;
+    offline.online = false;
+    SpoolingSender offline_sender{offline, spool};
+    EXPECT_FALSE(offline_sender.send(batch("keep-me")).ok);
+    ASSERT_EQ(spool.count(), 1u);
+
+    // Now push more permanently-rejected batches than the spool can hold.
+    FixedStatusSink rejected{422};
+    SpoolingSender rejecting_sender{rejected, spool};
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_FALSE(rejecting_sender.send(batch("junk")).ok);
+    }
+
+    ASSERT_EQ(spool.count(), 1u) << "the spool should still hold only the good batch";
+
+    // The survivor must be the recoverable one: bring the sink back and confirm
+    // it replays.
+    offline.online = true;
+    const auto replayed = offline_sender.replay();
+    EXPECT_EQ(replayed.replayed, 1u);
+    EXPECT_EQ(replayed.discarded, 0u) << "the offline batch was evicted by junk";
+    EXPECT_EQ(spool.count(), 0u);
 }
 
 TEST_F(SpoolingSenderTest, ReplayDrainsSpoolAfterRecovery) {
@@ -162,21 +223,6 @@ TEST_F(SpoolingSenderTest, ReplayDiscardsPermanentlyRejectedBatchAndContinues) {
     EXPECT_EQ(sink.delivered[0], "good-1");
     EXPECT_EQ(sink.delivered[1], "good-2");
 }
-
-// A sink that always answers with one fixed status, to pin down which statuses
-// cause replay() to keep a batch versus destroy it.
-class FixedStatusSink : public EventSink {
-public:
-    explicit FixedStatusSink(int status) : status_(status) {}
-    SendResult send(const nlohmann::json&) override {
-        ++sends;
-        return SendResult::failure(status_, "fixed");
-    }
-    int sends = 0;
-
-private:
-    int status_;
-};
 
 // Regression (CB-8): 429 was misfiled as a permanent failure, so replay()
 // discarded the batch. Rate limiting is the collector asking for a slower

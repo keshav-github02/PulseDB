@@ -11,15 +11,32 @@ SpoolingSender::SpoolingSender(EventSink& downstream, SpoolStore& spool)
 
 SendResult SpoolingSender::send(const nlohmann::json& events) {
     SendResult result = downstream_.send(events);
-    if (!result.ok) {
-        // save() returns an empty path when the write failed, in which case the
-        // batch really is lost. Counting it as spooled would have reported data
-        // as safely persisted when it was not.
-        if (spool_.save(events).empty()) {
-            ++spool_failures_;
-        } else {
-            ++spooled_;
-        }
+    if (result.ok) {
+        return result;
+    }
+
+    // Only spool what a retry could plausibly deliver. Every failure used to be
+    // written to disk, including a permanent 4xx -- which replay() then loaded,
+    // resent, and discarded on the identical verdict, so the round trip bought
+    // nothing.
+    //
+    // It cost something, though. The spool is capped and evicts oldest-first, so
+    // undeliverable batches displace ones that were merely offline and would
+    // have been recovered: a client with a schema bug quietly destroys its own
+    // good backlog, and the tighter the collector's validation, the faster it
+    // happens. Dropping here matches what replay() already does on arrival.
+    if (!is_retryable(result)) {
+        ++discarded_;
+        return result;
+    }
+
+    // save() returns an empty path when the write failed, in which case the
+    // batch really is lost. Counting it as spooled would have reported data
+    // as safely persisted when it was not.
+    if (spool_.save(events).empty()) {
+        ++spool_failures_;
+    } else {
+        ++spooled_;
     }
     return result;
 }

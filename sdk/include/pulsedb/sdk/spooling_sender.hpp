@@ -31,7 +31,11 @@ public:
 
     SpoolingSender(EventSink& downstream, SpoolStore& spool);
 
-    /// Forward to the downstream sink; spool the batch on failure.
+    /// Forward to the downstream sink; spool the batch on a *transient* failure.
+    ///
+    /// A permanent rejection is counted in discarded_count() and not written:
+    /// the spool is bounded and evicts oldest-first, so keeping a batch no retry
+    /// can deliver would evict one that a retry could.
     [[nodiscard]] SendResult send(const nlohmann::json& events) override;
 
     /// Attempt to deliver every spooled batch, oldest-first. Stops at the first
@@ -41,7 +45,8 @@ public:
     /// Number of batches this instance has spooled.
     std::size_t spooled_count() const noexcept { return spooled_; }
 
-    /// Batches dropped because the collector rejected them permanently.
+    /// Batches dropped because the collector rejected them permanently, whether
+    /// on the initial send() or on replay().
     std::size_t discarded_count() const noexcept { return discarded_; }
 
     /// Batches that could not even be written to the spool, and so are lost.

@@ -266,3 +266,40 @@ Target resume bullets:
     event volumes.
 
 ------------------------------------------------------------------------
+
+# 11. Engineering Principles
+
+The constraints the implementation is held to, and what each one buys.
+
+1.  **One module per increment.** A module is built and tested to
+    completion before the next begins, so a regression is attributable to
+    a small recent change rather than to a large simultaneous landing.
+2.  **Loose coupling across module boundaries.** A module depends on its
+    neighbours' interfaces, never their internals, so each pipeline stage
+    can be reasoned about -- and benchmarked -- on its own.
+3.  **Interfaces and dependency injection at the seams.** `EventProcessor`
+    is the canonical case: the worker pool consumes the interface and
+    stays oblivious to whether processing means accumulating totals or
+    folding events into time buckets. That same seam is what lets tests
+    drive the pool with a stub instead of a live aggregation engine.
+4.  **Composition over inheritance.** The SDK's delivery path is a chain
+    of composed `EventSink` decorators -- HTTP, then retry-with-backoff,
+    then spool-to-disk -- each independently testable, rather than one
+    class inheriting every behaviour.
+5.  **Modern C++20 throughout**, RAII for every resource, and no global
+    mutable state.
+6.  **A unit test for every module**, plus integration tests over real
+    sockets and stress tests for anything claiming thread safety. A
+    concurrency claim with no test that stresses it is an assumption.
+7.  **Every public class documented** with the trade-off it makes and the
+    failure it guards against -- not merely what it does.
+8.  **Readability over cleverness.** Where a faster construction would
+    obscure intent, the clearer one wins unless a benchmark shows the
+    difference lands on a hot path.
+
+This specification is deliberately architecture-first: it fixes the
+boundaries and the invariants and leaves the implementation free within
+them. The result should read as production software rather than as a
+tutorial.
+
+------------------------------------------------------------------------

@@ -3,6 +3,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstddef>
+#include <iterator>
 #include <thread>
 #include <vector>
 
@@ -93,6 +95,47 @@ TEST(TimeSeriesStoreTest, ConcurrentGetOrCreateAndUpdateIsConsistent) {
         total += b.count.load();
     });
     EXPECT_EQ(total, static_cast<long long>(kThreads) * kPerThread);
+}
+
+// minute_count() is maintained incrementally on insert rather than counted by
+// traversal, so it can only be trusted if it cannot drift from the buckets that
+// actually exist. Cross-check it against a real walk, including the re-insert
+// path where get_or_create() finds an existing bucket and must *not* count again.
+TEST(TimeSeriesStoreTest, MinuteCountAgreesWithATraversal) {
+    TimeSeriesStore<CountBucket> store;
+    const auto walked = [&store] {
+        std::size_t n = 0;
+        store.for_each([&n](const MinuteKey&, const CountBucket&) { ++n; });
+        return n;
+    };
+
+    EXPECT_EQ(store.minute_count(), 0u);
+    EXPECT_EQ(store.minute_count(), walked());
+
+    // Spread across every level of the nested calendar map, so a bucket created
+    // via a fresh year/month/day/hour path is counted the same as a sibling
+    // minute added under an existing one.
+    const MinuteKey keys[] = {
+        {2026, 7, 18, 12, 0}, {2026, 7, 18, 12, 1},  // same hour
+        {2026, 7, 18, 13, 0},                        // new hour
+        {2026, 7, 19, 0, 0},                         // new day
+        {2026, 8, 1, 0, 0},                          // new month
+        {2027, 1, 1, 0, 0},                          // new year
+    };
+    for (const auto& key : keys) {
+        store.get_or_create(key);
+    }
+    EXPECT_EQ(store.minute_count(), std::size(keys));
+    EXPECT_EQ(store.minute_count(), walked());
+
+    // Touching the same keys again must not inflate the count.
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        for (const auto& key : keys) {
+            store.get_or_create(key).count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    EXPECT_EQ(store.minute_count(), std::size(keys));
+    EXPECT_EQ(store.minute_count(), walked());
 }
 
 }  // namespace

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <mutex>
 #include <unordered_map>
@@ -52,9 +53,13 @@ public:
         if (Bucket* existing = find_locked(key)) {
             return *existing;
         }
-        return years_[key.year][key.month][key.day][key.hour]
-            .try_emplace(key.minute)
-            .first->second;
+        Bucket& created = years_[key.year][key.month][key.day][key.hour]
+                              .try_emplace(key.minute)
+                              .first->second;
+        // find_locked() just proved the minute is absent, so this always inserts
+        // exactly one bucket and the count can be maintained incrementally.
+        minute_count_.fetch_add(1, std::memory_order_relaxed);
+        return created;
     }
 
     /// Invoke @p fn(const Bucket&) if a bucket exists for @p key.
@@ -88,10 +93,15 @@ public:
     }
 
     /// Number of distinct minute buckets currently stored.
-    std::size_t minute_count() const {
-        std::size_t count = 0;
-        for_each([&count](const MinuteKey&, const Bucket&) { ++count; });
-        return count;
+    ///
+    /// O(1) and lock-free. It used to walk every bucket under the store mutex --
+    /// the same mutex ingestion takes -- purely to produce a number insertion
+    /// already knew. That cost was paid twice per dashboard cycle: once by the
+    /// reporter thread's status line, and again by GET /metrics for
+    /// "minutes_tracked", both of which run while events are arriving and grow
+    /// with uptime because buckets are never evicted.
+    std::size_t minute_count() const noexcept {
+        return minute_count_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -123,6 +133,9 @@ private:
 
     mutable std::mutex mutex_;
     YearMap years_;
+    /// Written under mutex_, read without it, so it must be atomic even though
+    /// only one writer path exists.
+    std::atomic<std::size_t> minute_count_{0};
 };
 
 }  // namespace pulsedb::storage

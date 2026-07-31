@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <random>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <nlohmann/json.hpp>

@@ -145,6 +145,24 @@ private:
         /// when the breakdown loses resolution.
         processor::MetricAccumulator& get_or_create(const std::string& name) {
             std::lock_guard lock(mutex_);
+            // kOverflowSegmentName is reserved, and has exactly one home: the
+            // dedicated accumulator below. Two callers reach here with it.
+            //
+            // A restore does, because a snapshot records the overflow segment as
+            // an ordinary named row. Letting that become a normal map entry while
+            // subsequent labels still folded into overflow_ made snapshot() emit
+            // *two* segments sharing this name -- so /metrics/player returned a
+            // duplicate key, the dashboard drew two identically-labelled bars,
+            // and any consumer keyed by name double-counted or silently picked
+            // one. Reachable after any restart of a deployment that had exceeded
+            // the cardinality cap.
+            //
+            // A client can too, and routing it here also stops it occupying one
+            // of the capped slots or forging a row that looks like this
+            // aggregator's own bookkeeping.
+            if (name == kOverflowSegmentName) {
+                return overflow_;
+            }
             if (const auto it = map_.find(name); it != map_.end()) {
                 return it->second;
             }

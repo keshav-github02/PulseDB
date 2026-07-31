@@ -62,8 +62,13 @@ std::vector<Segment> AggregationEngine::SegmentMap::snapshot() const {
     }
     // Surface the overflow bucket only once something has landed in it, so a
     // normal deployment never sees a spurious "__other__" row.
-    if (overflows() > 0) {
-        segments.push_back(Segment{std::string(kOverflowSegmentName), overflow_.snapshot()});
+    //
+    // Keyed on the accumulator's own contents, not on the overflows() counter: a
+    // restored snapshot puts events here without any label having been folded in
+    // during this process's lifetime, and gating on the counter discarded them
+    // from the response entirely.
+    if (const auto overflow = overflow_.snapshot(); overflow.total_events > 0) {
+        segments.push_back(Segment{std::string(kOverflowSegmentName), overflow});
     }
     std::sort(segments.begin(), segments.end(),
               [](const Segment& a, const Segment& b) { return a.name < b.name; });

@@ -459,4 +459,64 @@ TEST(AggregationEngineTest, ConcurrentIngestIsStructurallySoundAcrossRepeats) {
     }
 }
 
+// --- The overflow segment must have exactly one home ------------------------
+// A snapshot records "__other__" as an ordinary row, so restoring one puts that
+// name back through the same path a client-supplied label takes. If it lands in
+// the segment map as a normal entry while later labels still fold into the
+// dedicated overflow accumulator, the breakdown reports the same name twice.
+// Reachable after any restart of a deployment that exceeded the cardinality cap.
+
+TEST(AggregationEngineTest, RestoringTheOverflowSegmentDoesNotDuplicateIt) {
+    pulsedb::aggregation::AggregationOptions options;
+    options.max_segments_per_dimension = 2;
+    AggregationEngine engine{options};
+
+    // Restore "__other__" first, exactly as a snapshot sorted by name would
+    // replay it when the real labels are lowercase ('_' sorts before 'a').
+    pulsedb::processor::MetricsSnapshot restored;
+    restored.total_events = 7;
+    restored.total_views = 7;
+    engine.restore_player(std::string(pulsedb::aggregation::kOverflowSegmentName), restored);
+
+    // Now push past the cap so live labels overflow too.
+    engine.process(view_on(kMinuteA, "alpha", "d"));
+    engine.process(view_on(kMinuteA, "beta", "d"));
+    engine.process(view_on(kMinuteA, "gamma", "d"));  // over the cap -> overflow
+
+    const auto players = engine.by_player();
+    const auto overflow_rows = std::count_if(
+        players.begin(), players.end(), [](const pulsedb::aggregation::Segment& s) {
+            return s.name == pulsedb::aggregation::kOverflowSegmentName;
+        });
+    EXPECT_EQ(overflow_rows, 1)
+        << "the breakdown must not report two segments sharing one name";
+
+    // And the restored events must still be present, not dropped on the way.
+    for (const auto& segment : players) {
+        if (segment.name == pulsedb::aggregation::kOverflowSegmentName) {
+            EXPECT_GE(segment.metrics.total_events, restored.total_events)
+                << "restored overflow counters were lost";
+        }
+    }
+}
+
+TEST(AggregationEngineTest, ReservedOverflowNameFromAClientFoldsIntoOverflow) {
+    // The name is reserved, so a client sending it must not be able to occupy a
+    // capped slot or forge a row that looks like the aggregator's own.
+    pulsedb::aggregation::AggregationOptions options;
+    options.max_segments_per_dimension = 4;
+    AggregationEngine engine{options};
+
+    engine.process(view_on(kMinuteA, std::string(pulsedb::aggregation::kOverflowSegmentName), "d"));
+    engine.process(view_on(kMinuteA, "real", "d"));
+
+    const auto players = engine.by_player();
+    EXPECT_EQ(players.size(), 2u);
+    EXPECT_EQ(std::count_if(players.begin(), players.end(),
+                            [](const pulsedb::aggregation::Segment& s) {
+                                return s.name == pulsedb::aggregation::kOverflowSegmentName;
+                            }),
+              1);
+}
+
 }  // namespace

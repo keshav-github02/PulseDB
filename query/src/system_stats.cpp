@@ -81,22 +81,47 @@ std::uint64_t process_cpu_ns() {
 
 }  // namespace
 
+double SystemStats::percent_from_samples(std::uint64_t cpu_ns, std::uint64_t wall_ns,
+                                         std::uint64_t last_cpu_ns,
+                                         std::uint64_t last_wall_ns) {
+    // Both counters are monotonic in normal operation, so a decrease means the
+    // pair is unusable. Subtracting anyway is not a small error: these are
+    // unsigned, so `cpu_ns - last_cpu_ns` wraps to ~1.8e19 and the reported
+    // percentage becomes astronomical rather than merely wrong.
+    if (cpu_ns < last_cpu_ns || wall_ns <= last_wall_ns) {
+        return 0.0;
+    }
+    const double d_cpu = static_cast<double>(cpu_ns - last_cpu_ns);
+    const double d_wall = static_cast<double>(wall_ns - last_wall_ns);
+    return 100.0 * d_cpu / d_wall;
+}
+
 double SystemStats::cpu_percent() {
     const std::uint64_t cpu = process_cpu_ns();
     const std::uint64_t wall = wall_ns();
+
+    // process_cpu_ns() returns 0 to mean "could not read the counter" -- a failed
+    // GetProcessTimes, an unreadable /proc/self/stat, an unusable _SC_CLK_TCK.
+    // That is not a measurement, and adopting it as the baseline made a single
+    // failed read cost *two* wrong readings: the failing call underflowed the
+    // unsigned subtraction, and the next one then divided the whole process
+    // lifetime by one sampling interval. Leave the baseline untouched and report
+    // the sample as unknown. (A process that has genuinely accrued no CPU time
+    // yet also reads 0 here, for which 0% is the right answer anyway.)
+    if (cpu == 0) {
+        return 0.0;
+    }
+
     if (last_wall_ns_ == 0) {
         last_cpu_ns_ = cpu;
         last_wall_ns_ = wall;
         return 0.0;
     }
-    const double d_cpu = static_cast<double>(cpu - last_cpu_ns_);
-    const double d_wall = static_cast<double>(wall - last_wall_ns_);
+
+    const double percent = percent_from_samples(cpu, wall, last_cpu_ns_, last_wall_ns_);
     last_cpu_ns_ = cpu;
     last_wall_ns_ = wall;
-    if (d_wall <= 0.0) {
-        return 0.0;
-    }
-    return 100.0 * d_cpu / d_wall;
+    return percent;
 }
 
 #ifdef _WIN32

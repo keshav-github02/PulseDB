@@ -84,7 +84,8 @@ gtest_discover_tests(pulsedb_aggregation_tests)
 add_executable(pulsedb_query_tests
     query/metrics_api_test.cpp
     query/query_server_test.cpp
-    query/runtime_status_test.cpp)
+    query/runtime_status_test.cpp
+    query/system_stats_test.cpp)
 target_link_libraries(pulsedb_query_tests
     PRIVATE
         pulsedb::query

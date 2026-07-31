@@ -249,7 +249,13 @@ int main(int argc, char** argv) {
     std::thread reporter([&] {
         pulsedb::query::SystemStats sys;
         int ticks = 0;
-        std::uint64_t last_events = 0;
+        // Baseline from the engine's *current* total, not zero. Persistence means
+        // total_events is already large before the first tick, so a zero baseline
+        // reported the entire restored history as though it had all arrived in one
+        // 2-second interval -- a multi-million events/sec spike on the dashboard
+        // and in GET /status, once after every restart, on a gauge whose whole job
+        // is to show current load.
+        std::uint64_t last_events = engine.total().total_events;
         auto last_sample = std::chrono::steady_clock::now();
         while (!g_stop.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));

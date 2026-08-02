@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -194,13 +195,65 @@ TEST(AggregationEngineTest, NoOverflowSegmentWhenUnderTheCap) {
 
 TEST(AggregationEngineTest, CardinalityCapBoundsMemoryUnderAUniqueLabelFlood) {
     // The attack the cap exists for: a unique player name on every event.
-    AggregationEngine engine{{.max_segments_per_dimension = 10}};
+    // Single-threaded, so exactly one shard is touched and the cap is visible
+    // in isolation.
+    AggregationEngine engine{{.max_segments_per_dimension = 10, .shards = 1}};
     for (int i = 0; i < 5'000; ++i) {
         engine.process(view_on(kMinuteA, "u-" + std::to_string(i), "d-" + std::to_string(i)));
     }
     EXPECT_EQ(engine.by_player().size(), 11u);  // 10 + __other__
     EXPECT_EQ(engine.by_device().size(), 11u);
     EXPECT_EQ(engine.total().total_views, 5'000u);
+}
+
+// The test above drives one thread, and used to run on a default engine -- which
+// after sharding meant it only ever filled a single shard. That is not how the
+// flood arrives in production: it comes through the worker pool, and the cap is
+// enforced *per shard*, so the real ceiling is shards x cap rather than cap.
+// Measured at the time of writing, cap=10 on 8 shards returned 81 rows where the
+// single-threaded test asserted 11 -- the memory bound this test exists to prove
+// was 8x looser than the assertion suggested, and nothing covered the difference.
+//
+// Asserted as a bound rather than an equality because which shard a thread lands
+// on is a scheduling detail; the guarantee is that it is bounded at all.
+TEST(AggregationEngineTest, CardinalityCapStillBoundsMemoryWhenFloodedFromEveryWorker) {
+    constexpr std::size_t kCap = 10;
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 5'000;
+
+    AggregationEngine engine{{.max_segments_per_dimension = kCap, .shards = 4}};
+    const std::size_t ceiling = kCap * engine.shard_count() + 1;  // + __other__
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&engine, t] {
+            for (int i = 0; i < kPerThread; ++i) {
+                const std::string suffix =
+                    std::to_string(t) + "-" + std::to_string(i);  // unique per event
+                engine.process(view_on(kMinuteA, "u-" + suffix, "d-" + suffix));
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    EXPECT_LE(engine.by_player().size(), ceiling)
+        << "a unique-label flood must stay bounded across every shard, not just one";
+    EXPECT_LE(engine.by_device().size(), ceiling);
+    EXPECT_GE(engine.by_player().size(), kCap)
+        << "at least one shard should have filled, or the flood never reached the cap";
+
+    // Folding loses resolution, never events -- the property that makes the cap
+    // safe to apply at all.
+    constexpr auto kExpected = static_cast<std::uint64_t>(kThreads) * kPerThread;
+    EXPECT_EQ(engine.total().total_views, kExpected);
+    std::uint64_t summed = 0;
+    for (const auto& s : engine.by_player()) {
+        summed += s.metrics.total_views;
+    }
+    EXPECT_EQ(summed, kExpected) << "events were lost while folding into __other__";
 }
 
 TEST(AggregationEngineTest, IgnoresEmptySegmentNames) {

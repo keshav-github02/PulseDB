@@ -44,6 +44,38 @@ struct QueryServer::Impl {
     }
 
     void setup_routes() {
+        // An index at the root, because nothing was served there and a bare
+        // http://host:<query_port>/ answered 404. That is technically correct --
+        // this port carries a JSON API, not a site -- but it is also the first
+        // thing anyone tries, and a 404 reads as "the server is broken" rather
+        // than "you want a path". Listing the routes turns the dead end into a
+        // pointer, and costs nothing to keep accurate.
+        server.Get("/", [this](const httplib::Request&, httplib::Response& res) {
+            write_json(
+                res,
+                {{"service", "pulsedb-metrics-api"},
+                 {"description", "Read-only metrics API. Event ingestion is a separate "
+                                 "port -- POST /v1/events there, not here."},
+                 {"endpoints",
+                  {{"/metrics", "platform-wide totals plus the number of minute buckets"},
+                   {"/metrics/live?minutes=N",
+                    "the N most recent per-minute buckets; N is clamped to "
+                    "max_response_minutes"},
+                   {"/metrics/range?from=<epoch_ms>&to=<epoch_ms>",
+                    "buckets within a window; a window wider than max_response_minutes "
+                    "is refused with 400 rather than truncated"},
+                   {"/metrics/player", "per-player metric breakdown"},
+                   {"/metrics/device", "per-device metric breakdown"},
+                   {"/status",
+                    "live operational metrics: events/sec, queue depth, active sessions, "
+                    "error rate, CPU, memory, uptime"},
+                   {"/health", "liveness probe"}}},
+                 {"max_response_minutes", config.max_response_minutes},
+                 {"dashboard",
+                  "a separate Vite app: run `npm run dev` in dashboard/ and open the "
+                  "URL it prints (it polls this API)"}});
+        });
+
         server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
             write_json(res, {{"status", "ok"}});
         });

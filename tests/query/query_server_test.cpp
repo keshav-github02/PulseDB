@@ -3,11 +3,13 @@
 #include <gtest/gtest.h>
 #include <httplib.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -66,6 +68,48 @@ protected:
     std::thread thread_;
     int port_ = -1;
 };
+
+// The root used to 404, which is correct for a JSON API but is also the first
+// URL anyone opens -- it reads as a broken server rather than a missing path.
+TEST_F(QueryServerTest, RootServesAnIndexInsteadOf404) {
+    const auto res = client_->Get("/");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200);
+    EXPECT_EQ(res->get_header_value("Access-Control-Allow-Origin"), "*");
+
+    const auto j = nlohmann::json::parse(res->body);
+    EXPECT_EQ(j["service"], "pulsedb-metrics-api");
+    ASSERT_TRUE(j.contains("endpoints"));
+    EXPECT_TRUE(j["endpoints"].is_object());
+    EXPECT_TRUE(j.contains("dashboard")) << "the index should point at the dashboard";
+}
+
+// An index that drifts is worse than none: it documents routes that may not
+// exist and hides ones that do. Every advertised path must answer, and every
+// route the server serves must be advertised.
+TEST_F(QueryServerTest, IndexListsExactlyTheRoutesThatExist) {
+    const auto index = nlohmann::json::parse(client_->Get("/")->body);
+
+    // Advertised paths (minus any query string) must not 404.
+    std::vector<std::string> advertised;
+    for (const auto& entry : index["endpoints"].items()) {
+        std::string path = entry.key();
+        if (const auto q = path.find('?'); q != std::string::npos) {
+            path = path.substr(0, q);
+        }
+        advertised.push_back(path);
+        const auto res = client_->Get(path);
+        ASSERT_TRUE(res) << path;
+        EXPECT_NE(res->status, 404) << "index advertises " << path << " but it does not exist";
+    }
+
+    // ...and nothing the server serves is left undocumented.
+    for (const char* route : {"/metrics", "/metrics/live", "/metrics/range",
+                              "/metrics/player", "/metrics/device", "/status", "/health"}) {
+        EXPECT_NE(std::find(advertised.begin(), advertised.end(), route), advertised.end())
+            << route << " is served but missing from the index";
+    }
+}
 
 TEST_F(QueryServerTest, MetricsEndpointReturnsTotals) {
     const auto res = client_->Get("/metrics");

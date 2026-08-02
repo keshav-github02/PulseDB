@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -64,18 +65,36 @@ inline std::optional<Event> parse_event(const nlohmann::json& value) {
         it != value.end() && it->is_number_integer()) {
         event.timestamp_ms = it->get<std::int64_t>();
     }
-    if (const auto it = value.find("startup_time_ms");
-        it != value.end() && it->is_number_integer()) {
-        event.startup_time_ms = it->get<int>();
-    }
-    if (const auto it = value.find("buffer_duration_ms");
-        it != value.end() && it->is_number_integer()) {
-        event.buffer_duration_ms = it->get<int>();
-    }
-    if (const auto it = value.find("bitrate_kbps");
-        it != value.end() && it->is_number_integer()) {
-        event.bitrate_kbps = it->get<int>();
-    }
+
+    /// Read an integer payload that is stored as `int`, leaving it unset if the
+    /// value will not fit.
+    ///
+    /// These were read with get<int>(), which narrows a wider JSON integer
+    /// modularly rather than failing -- so the payload did not merely arrive
+    /// wrong, it arrived *plausible*: 4294967796 became 500 and was folded into
+    /// the mean startup time as though it had been measured. 8589934592 became 0,
+    /// and 2147483648 became negative.
+    ///
+    /// The ingest layer range-checks these fields and answers 422, so an HTTP
+    /// client cannot reach this. parse_event() is public core API though, and
+    /// this mirrors what MetricAccumulator already does for negative samples:
+    /// enforce the invariant where the value is interpreted, so it holds for
+    /// callers that never went through HTTP. Out of range is treated exactly like
+    /// absent -- it contributes to neither a sum nor a sample count.
+    const auto get_int = [&](const char* key, std::optional<int>& out) {
+        const auto it = value.find(key);
+        if (it == value.end() || !it->is_number_integer()) {
+            return;
+        }
+        const auto raw = it->get<std::int64_t>();
+        if (raw < std::numeric_limits<int>::min() || raw > std::numeric_limits<int>::max()) {
+            return;
+        }
+        out = static_cast<int>(raw);
+    };
+    get_int("startup_time_ms", event.startup_time_ms);
+    get_int("buffer_duration_ms", event.buffer_duration_ms);
+    get_int("bitrate_kbps", event.bitrate_kbps);
     if (const auto it = value.find("watch_time_ms");
         it != value.end() && it->is_number_integer()) {
         event.watch_time_ms = it->get<std::int64_t>();

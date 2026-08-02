@@ -89,4 +89,58 @@ TEST(ParseEventTest, RejectsNonObject) {
     EXPECT_FALSE(parse_event(nlohmann::json::parse("42")).has_value());
 }
 
+// Regression: startup_time_ms, buffer_duration_ms and bitrate_kbps are stored as
+// `int` and were read with get<int>(), which narrows a wider JSON integer
+// modularly instead of failing. The payload therefore did not arrive wrong so
+// much as arrive *believable* -- 4294967796 became 500 and was folded into the
+// mean startup time as though it had been measured. Out of range is now treated
+// exactly like absent, so it contributes to neither a sum nor a sample count.
+TEST(EventParseTest, OutOfRangeIntPayloadsAreDroppedNotWrapped) {
+    struct Case {
+        const char* body;
+        const char* field;
+    };
+    for (const auto& [body, field] :
+         {Case{R"({"event_type":"startup_complete","startup_time_ms":4294967796})",
+               "startup_time_ms"},
+          Case{R"({"event_type":"bitrate_change","bitrate_kbps":8589934592})", "bitrate_kbps"},
+          Case{R"({"event_type":"buffer_end","buffer_duration_ms":2147483648})",
+               "buffer_duration_ms"},
+          Case{R"({"event_type":"buffer_end","buffer_duration_ms":-2147483649})",
+               "buffer_duration_ms (negative)"}}) {
+        const auto event = parse_event(nlohmann::json::parse(body));
+        ASSERT_TRUE(event.has_value()) << field << ": the event itself is still parsed";
+        EXPECT_FALSE(event->startup_time_ms.has_value()) << field;
+        EXPECT_FALSE(event->bitrate_kbps.has_value()) << field;
+        EXPECT_FALSE(event->buffer_duration_ms.has_value()) << field;
+    }
+}
+
+TEST(EventParseTest, InRangeIntPayloadsStillParse) {
+    // The boundary must stay inclusive -- the guard rejects what cannot be
+    // represented, not what merely looks large.
+    const auto max_int = parse_event(nlohmann::json::parse(
+        R"({"event_type":"bitrate_change","bitrate_kbps":2147483647})"));
+    ASSERT_TRUE(max_int.has_value());
+    ASSERT_TRUE(max_int->bitrate_kbps.has_value());
+    EXPECT_EQ(*max_int->bitrate_kbps, 2147483647);
+
+    const auto ordinary = parse_event(nlohmann::json::parse(
+        R"({"event_type":"startup_complete","startup_time_ms":1800})"));
+    ASSERT_TRUE(ordinary.has_value());
+    ASSERT_TRUE(ordinary->startup_time_ms.has_value());
+    EXPECT_EQ(*ordinary->startup_time_ms, 1800);
+}
+
+// watch_time_ms is already int64 on the wire and in the struct, so it has no
+// narrowing step to get wrong. Pinned so a later change to its type cannot
+// quietly reintroduce one.
+TEST(EventParseTest, WatchTimeKeepsFullSixtyFourBitRange) {
+    const auto event = parse_event(nlohmann::json::parse(
+        R"({"event_type":"playback_end","watch_time_ms":4294967796})"));
+    ASSERT_TRUE(event.has_value());
+    ASSERT_TRUE(event->watch_time_ms.has_value());
+    EXPECT_EQ(*event->watch_time_ms, 4294967796LL);
+}
+
 }  // namespace

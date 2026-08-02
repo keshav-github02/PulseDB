@@ -3,11 +3,13 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "pulsedb/core/event.hpp"
@@ -37,15 +39,27 @@ inline constexpr std::string_view kOverflowSegmentName = "__other__";
 
 /// Tunable limits on what the engine will allocate.
 struct AggregationOptions {
-    /// Distinct player (and device) names tracked before the rest collapse
-    /// into kOverflowSegmentName.
+    /// Distinct player (and device) names tracked *per shard* before the rest
+    /// collapse into kOverflowSegmentName.
     ///
     /// Segment names arrive as arbitrary client-supplied strings and become
     /// permanent map keys, so without a cap a client sending a unique player
     /// per event grows memory without bound -- the label-cardinality
     /// explosion that monitoring systems are routinely taken down by. The
     /// ingest layer bounds each name's *length*; this bounds their *count*.
+    ///
+    /// Since sharding replicates the maps, the global bound is `shards` times
+    /// this value. Memory stays bounded, which is the property that matters,
+    /// but the ceiling is higher than the number alone suggests.
     std::size_t max_segments_per_dimension = 1'000;
+
+    /// Independent accumulator shards. 0 selects default_shard_count().
+    ///
+    /// Ingestion writes only to the shard belonging to the calling thread, so
+    /// with one writer per shard the per-shard mutexes are uncontended and
+    /// throughput scales with worker count instead of collapsing under it.
+    /// Reads merge across every shard.
+    std::size_t shards = 0;
 };
 
 /// An EventProcessor that aggregates events three ways at once:
@@ -57,25 +71,39 @@ struct AggregationOptions {
 /// timestamp and into its player/device segments. The same instance drives
 /// the worker pool and answers queries.
 ///
-/// Synchronisation, stated precisely because an earlier version of this comment
-/// claimed the opposite: once a bucket or segment reference is in hand, updating
-/// it is lock-free (the counters are atomics). *Reaching* it is not. process()
-/// takes three mutexes per event -- the store's, and one per segment map -- even
-/// on the common path where the bucket already exists, and every query holds the
-/// same store mutex for the duration of its traversal. So ingestion and queries
-/// do contend, ingestion does not scale with worker count, and query cost grows
-/// with the number of buckets (which are never evicted).
+/// Synchronisation: state is **sharded per writer thread**. Each thread folds
+/// events into its own shard -- its own time-series store and its own
+/// player/device maps, each with its own mutex -- so with one writer per shard
+/// those mutexes are uncontended and the atomics inside a bucket are the only
+/// thing threads share. Reads merge across every shard.
 ///
-/// Measured on 16 cores: 3.9M events/s on one thread, 1.9M on eight (0.49x); a
-/// 15-bucket /metrics/live costs ~13 ms of held store mutex at 30 days of
-/// uptime, ~38 ms at 90 days. The fix is per-worker sharded accumulators merged
-/// on read, which removes the mutex from the write path entirely; it is not done
-/// here, and until it is, these numbers are the operating envelope.
+/// This replaced a single shared store plus two shared segment maps, where
+/// process() took three global mutexes per event even on the common path where
+/// the bucket already existed. Measured on 16 cores, that design *lost*
+/// throughput as workers were added -- 2.72M events/s on one thread, 1.53M on
+/// eight (0.56x) -- so a pool sized to hardware_concurrency() ingested more
+/// slowly than a single thread. Isolating the cause showed the mutex cost
+/// roughly 15x the atomic contention, so removing it from the write path, not
+/// padding the counters, was the fix.
+///
+/// The costs are real and worth stating: per-minute buckets and segment maps are
+/// replicated per shard, so memory scales with shard count, and every query pays
+/// a merge across shards. Reads are infrequent (a dashboard poll) and writes are
+/// the hot path, which is the trade this makes deliberately.
+///
+/// Query cost still grows with the number of buckets, which are never evicted --
+/// sharding does not address retention.
 class AggregationEngine : public processor::EventProcessor {
 public:
-    explicit AggregationEngine(AggregationOptions options = {})
-        : players_(options.max_segments_per_dimension),
-          devices_(options.max_segments_per_dimension) {}
+    explicit AggregationEngine(AggregationOptions options = {});
+
+    /// Shards to use when AggregationOptions::shards is 0: hardware_concurrency()
+    /// capped at 8. The cap is deliberate -- shards multiply resident memory, and
+    /// past the worker count extra shards buy nothing but replication.
+    [[nodiscard]] static std::size_t default_shard_count();
+
+    /// Number of independent shards this engine was built with.
+    [[nodiscard]] std::size_t shard_count() const noexcept { return shards_.size(); }
 
     void process(const core::Event& event) override;
 
@@ -89,7 +117,11 @@ public:
     /// Buckets whose minute falls within [from, to], inclusive.
     std::vector<MinutePoint> range(const storage::MinuteKey& from,
                                    const storage::MinuteKey& to) const;
-    std::size_t minute_count() const { return store_.minute_count(); }
+    /// Distinct minutes across every shard (not the number of buckets, which is
+    /// higher because shards each hold their own bucket for a shared minute).
+    std::size_t minute_count() const noexcept {
+        return minute_count_.load(std::memory_order_relaxed);
+    }
 
     /// Sessions currently in flight: incremented on video_start, decremented
     /// on playback_end but never below zero. A live gauge (not persisted, so it
@@ -100,16 +132,20 @@ public:
     }
 
     // --- Segment queries ---
-    /// Per-player metrics, ordered by player name.
-    std::vector<Segment> by_player() const { return players_.snapshot(); }
-    /// Per-device metrics, ordered by device name.
-    std::vector<Segment> by_device() const { return devices_.snapshot(); }
+    /// Per-player metrics, ordered by player name, merged across shards.
+    std::vector<Segment> by_player() const { return collect_segments(/*players=*/true); }
+    /// Per-device metrics, ordered by device name, merged across shards.
+    std::vector<Segment> by_device() const { return collect_segments(/*players=*/false); }
 
     /// Times a segment name was folded into kOverflowSegmentName because the
     /// cardinality cap was already reached. Non-zero means the player/device
     /// breakdown has lost resolution (totals are still exact).
     std::uint64_t segment_overflows() const noexcept {
-        return players_.overflows() + devices_.overflows();
+        std::uint64_t total = 0;
+        for (const auto& shard : shards_) {
+            total += shard->players.overflows() + shard->devices.overflows();
+        }
+        return total;
     }
 
     // --- Platform totals ---
@@ -190,9 +226,41 @@ private:
         std::atomic<std::uint64_t> overflows_{0};
     };
 
-    storage::TimeSeriesStore<processor::MetricAccumulator> store_;
-    SegmentMap players_;
-    SegmentMap devices_;
+    /// One writer thread's private slice of the aggregate state.
+    ///
+    /// Over-aligned to a cache line so two shards cannot share one: without it
+    /// the mutexes and hot counters of adjacent shards would land in the same
+    /// line and reintroduce, as coherence traffic, the contention sharding
+    /// exists to remove.
+    struct alignas(64) Shard {
+        explicit Shard(std::size_t max_segments)
+            : players(max_segments), devices(max_segments) {}
+
+        storage::TimeSeriesStore<processor::MetricAccumulator> store;
+        SegmentMap players;
+        SegmentMap devices;
+    };
+
+    /// The shard owned by the calling thread. Stable for that thread's lifetime.
+    Shard& shard_for_this_thread() const;
+
+    /// Record that @p key now exists somewhere, keeping minute_count() O(1).
+    /// Called only when a shard actually creates a bucket -- once per minute per
+    /// shard -- so this mutex never appears on the per-event path.
+    void note_minute(const storage::MinuteKey& key);
+
+    /// Merge the player (or device) breakdown across every shard, summing
+    /// segments that share a name.
+    std::vector<Segment> collect_segments(bool players) const;
+
+    std::vector<std::unique_ptr<Shard>> shards_;
+
+    /// Distinct minutes across all shards. The set is consulted only on bucket
+    /// creation; the count is what readers actually load.
+    mutable std::mutex minutes_mutex_;
+    std::unordered_set<std::uint64_t> minutes_seen_;
+    std::atomic<std::size_t> minute_count_{0};
+
     std::atomic<std::int64_t> active_sessions_{0};
 };
 

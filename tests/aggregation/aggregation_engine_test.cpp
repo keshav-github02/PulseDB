@@ -459,6 +459,108 @@ TEST(AggregationEngineTest, ConcurrentIngestIsStructurallySoundAcrossRepeats) {
     }
 }
 
+// --- Sharding ---------------------------------------------------------------
+// State is partitioned per writer thread, so the same minute and the same
+// segment name legitimately exist in several shards at once. Every read has to
+// merge them; a missed merge would surface as duplicate rows or as totals that
+// only count one shard's share.
+
+TEST(AggregationEngineTest, MergesShardsIntoOnePointPerMinute) {
+    AggregationEngine engine{{.max_segments_per_dimension = 1'000, .shards = 4}};
+    ASSERT_EQ(engine.shard_count(), 4u);
+
+    constexpr int kThreads = 8;  // more threads than shards, so shards are shared
+    constexpr int kPerThread = 5'000;
+    constexpr int kMinutes = 3;
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&engine] {
+            for (int i = 0; i < kPerThread; ++i) {
+                Event e = view_at(kMinuteA + static_cast<std::int64_t>(i % kMinutes) * 60'000);
+                e.player = "ExoPlayer";
+                e.device = "Android";
+                engine.process(e);
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    constexpr auto kExpected = static_cast<std::uint64_t>(kThreads) * kPerThread;
+
+    EXPECT_EQ(engine.points().size(), static_cast<std::size_t>(kMinutes))
+        << "one point per minute, not one per shard per minute";
+    EXPECT_EQ(engine.minute_count(), static_cast<std::size_t>(kMinutes))
+        << "distinct minutes, not buckets allocated across shards";
+    EXPECT_EQ(engine.total().total_views, kExpected);
+
+    // Every minute's share must be whole, not one shard's slice of it.
+    std::uint64_t summed = 0;
+    for (const auto& point : engine.points()) {
+        summed += point.metrics.total_views;
+    }
+    EXPECT_EQ(summed, kExpected);
+
+    // A single label written from every thread stays a single row.
+    ASSERT_EQ(engine.by_player().size(), 1u);
+    EXPECT_EQ(engine.by_player().front().metrics.total_views, kExpected);
+    ASSERT_EQ(engine.by_device().size(), 1u);
+    EXPECT_EQ(engine.by_device().front().metrics.total_views, kExpected);
+}
+
+TEST(AggregationEngineTest, MinuteLookupSumsEveryShard) {
+    AggregationEngine engine{{.max_segments_per_dimension = 1'000, .shards = 4}};
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 1'000;
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&engine] {
+            for (int i = 0; i < kPerThread; ++i) {
+                engine.process(view_at(kMinuteA));  // all into one minute
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    const auto m = engine.minute(MinuteKey::from_timestamp_ms(kMinuteA));
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(m->total_views, static_cast<std::uint64_t>(kThreads) * kPerThread);
+
+    // An untouched minute is still absent, not an all-zero bucket.
+    EXPECT_FALSE(engine.minute(MinuteKey::from_timestamp_ms(kMinuteB)).has_value());
+}
+
+TEST(AggregationEngineTest, SingleShardIsStillCorrect) {
+    // The degenerate configuration must behave exactly as the unsharded engine
+    // did, so shards are a scaling knob and not a behaviour change.
+    AggregationEngine engine{{.max_segments_per_dimension = 1'000, .shards = 1}};
+    ASSERT_EQ(engine.shard_count(), 1u);
+
+    engine.process(view_on(kMinuteA, "ExoPlayer", "Android"));
+    engine.process(view_on(kMinuteA + 30'000, "AVPlayer", "iOS"));
+    engine.process(view_on(kMinuteB, "ExoPlayer", "Android"));
+
+    EXPECT_EQ(engine.minute_count(), 2u);
+    EXPECT_EQ(engine.total().total_views, 3u);
+    EXPECT_EQ(engine.points().size(), 2u);
+    EXPECT_EQ(engine.by_player().size(), 2u);
+}
+
+TEST(AggregationEngineTest, DefaultShardCountIsPositiveAndBounded) {
+    EXPECT_GE(AggregationEngine::default_shard_count(), 1u);
+    EXPECT_LE(AggregationEngine::default_shard_count(), 8u)
+        << "shards replicate state, so the default must not track core count without bound";
+    AggregationEngine engine;
+    EXPECT_EQ(engine.shard_count(), AggregationEngine::default_shard_count());
+}
+
 // --- The overflow segment must have exactly one home ------------------------
 // A snapshot records "__other__" as an ordinary row, so restoring one puts that
 // name back through the same path a client-supplied label takes. If it lands in

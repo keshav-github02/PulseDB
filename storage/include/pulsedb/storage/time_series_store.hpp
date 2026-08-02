@@ -48,18 +48,29 @@ class TimeSeriesStore {
 public:
     /// Return the bucket for @p key, creating it (and any missing calendar
     /// nodes) if absent. The returned reference is stable.
-    Bucket& get_or_create(const MinuteKey& key) {
+    /// @param created if non-null, set to whether this call inserted the bucket.
+    ///        Lets a caller react to a *new* minute appearing without paying for
+    ///        a second lookup, which is what keeps cross-shard bookkeeping off
+    ///        the per-event path: creation happens once per minute, not once per
+    ///        event.
+    Bucket& get_or_create(const MinuteKey& key, bool* created = nullptr) {
         std::lock_guard lock(mutex_);
         if (Bucket* existing = find_locked(key)) {
+            if (created != nullptr) {
+                *created = false;
+            }
             return *existing;
         }
-        Bucket& created = years_[key.year][key.month][key.day][key.hour]
-                              .try_emplace(key.minute)
-                              .first->second;
+        Bucket& inserted = years_[key.year][key.month][key.day][key.hour]
+                               .try_emplace(key.minute)
+                               .first->second;
         // find_locked() just proved the minute is absent, so this always inserts
         // exactly one bucket and the count can be maintained incrementally.
         minute_count_.fetch_add(1, std::memory_order_relaxed);
-        return created;
+        if (created != nullptr) {
+            *created = true;
+        }
+        return inserted;
     }
 
     /// Invoke @p fn(const Bucket&) if a bucket exists for @p key.

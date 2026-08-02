@@ -4,7 +4,9 @@
 
 #include <atomic>
 #include <filesystem>
+#include <fstream>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -132,6 +134,58 @@ TEST_F(SpoolStoreTest, SavedBatchesLeaveNoTempFilesBehind) {
         EXPECT_EQ(entry.path().filename().string().rfind(".tmp-", 0), std::string::npos)
             << "leftover temp file: " << entry.path();
     }
+}
+
+// --- Ordering must not depend on filename width -----------------------------
+// "oldest-first" is the invariant eviction and replay both rely on, and it was
+// implemented by sorting filenames as text. That is only equivalent to numeric
+// order while every name is the same width -- an assumption the writer holds
+// (it zero-pads to 8) but the reader does not (it accepts any digit count), and
+// that the writer itself breaks once the index needs a ninth digit.
+//
+// When it breaks it breaks silently and in the worst direction: save() evicts
+// list().front() to make room, so a mis-sort makes it delete the *newest* batch
+// instead of the oldest, and replay() then walks the spool backwards.
+
+TEST_F(SpoolStoreTest, ListIsOrderedNumericallyNotLexicographically) {
+    fs::create_directories(dir_);
+    // Widths deliberately mixed, as they become once the counter passes 8
+    // digits. Lexicographically "batch-100000000" precedes "batch-99999999";
+    // numerically it must follow it.
+    const std::pair<const char*, const char*> files[] = {
+        {"batch-99999999.json", "older"},
+        {"batch-100000000.json", "newer"},
+    };
+    for (const auto& [name, id] : files) {
+        std::ofstream out(dir_ / name, std::ios::binary);
+        out << batch(id).dump();
+    }
+
+    SpoolStore store{dir_};
+    const auto listed = store.list();
+    ASSERT_EQ(listed.size(), 2u);
+    EXPECT_EQ(store.load(listed[0]), batch("older")) << "oldest must come first";
+    EXPECT_EQ(store.load(listed[1]), batch("newer"));
+}
+
+TEST_F(SpoolStoreTest, EvictsTheOldestEvenWhenWidthsDiffer) {
+    fs::create_directories(dir_);
+    for (const auto& [name, id] : {std::pair<const char*, const char*>{"batch-99999999.json", "older"},
+                                   std::pair<const char*, const char*>{"batch-100000000.json", "newer"}}) {
+        std::ofstream out(dir_ / name, std::ios::binary);
+        out << batch(id).dump();
+    }
+
+    // Cap of 2 with two present, so saving a third must evict exactly one -- and
+    // it has to be the oldest, not whichever sorts first as text.
+    SpoolStore store{dir_, /*max_batches=*/2};
+    ASSERT_FALSE(store.save(batch("newest")).empty());
+
+    const auto listed = store.list();
+    ASSERT_EQ(listed.size(), 2u);
+    EXPECT_EQ(store.load(listed[0]), batch("newer"))
+        << "the newest batch was evicted instead of the oldest";
+    EXPECT_EQ(store.load(listed[1]), batch("newest"));
 }
 
 }  // namespace

@@ -12,8 +12,9 @@ namespace pulsedb::sdk {
 
 /// On-disk spool of event batches that could not be delivered.
 ///
-/// Each batch is written to its own JSON file named `batch-NNNNNNNN.json`,
-/// so lexicographic filename order is oldest-first. Writes are atomic
+/// Each batch is written to its own JSON file named `batch-NNNNNNNN.json` and
+/// ordered by the number in that name, so oldest-first holds regardless of how
+/// many digits the index needs. Writes are atomic
 /// (temp file + rename) and flushed to stable storage, so neither a crash nor a
 /// full disk can leave a partial batch that later looks valid.
 /// Survives process restarts: a new store continues the numbering from the

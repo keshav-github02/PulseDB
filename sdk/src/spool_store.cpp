@@ -7,6 +7,8 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <io.h>
@@ -121,12 +123,34 @@ std::vector<fs::path> SpoolStore::list_locked() const {
     if (!fs::exists(dir_, ec)) {
         return files;
     }
+
+    // Ordered by the parsed index, not by filename text.
+    //
+    // Sorting the names as strings is equivalent to numeric order only while
+    // every name is the same width. file_name() zero-pads to eight digits, so
+    // that held -- until the index needs a ninth, at which point the writer's own
+    // output mixes widths ("batch-100000000" sorts before "batch-99999999").
+    // index_of() also accepts any digit count, so a file written by another
+    // version or placed by hand breaks it immediately.
+    //
+    // The failure is silent and lands in the worst direction: save() evicts
+    // list().front() to make room, so a mis-sort deletes the *newest* batch
+    // rather than the oldest, and replay() walks the spool backwards. Sorting on
+    // the number makes oldest-first hold unconditionally, leaving the padding as
+    // presentation rather than as load-bearing.
+    std::vector<std::pair<unsigned long long, fs::path>> indexed;
     for (const auto& entry : fs::directory_iterator(dir_, ec)) {
-        if (index_of(entry.path())) {
-            files.push_back(entry.path());
+        if (const auto index = index_of(entry.path())) {
+            indexed.emplace_back(*index, entry.path());
         }
     }
-    std::sort(files.begin(), files.end());  // zero-padded names => oldest-first
+    std::sort(indexed.begin(), indexed.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    files.reserve(indexed.size());
+    for (auto& [index, path] : indexed) {
+        files.push_back(std::move(path));
+    }
     return files;
 }
 

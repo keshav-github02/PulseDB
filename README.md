@@ -21,7 +21,7 @@ Full design: [docs/PulseDB_Project_Specification.md](docs/PulseDB_Project_Specif
 | SDK Simulator | `sdk/` | ✅ Session generation, batching, retry + backoff, bounded offline spool + replay |
 | Worker Pool | `workers/` | ✅ `hardware_concurrency()` threads draining the queue |
 | Event Processor | `processor/` | ✅ Events → metrics (reusable lock-free `MetricAccumulator`) |
-| Aggregation Engine | `aggregation/` | ⚠️ Per-minute bucketing + capped player/device segments + queries — correct, but does not scale with worker count (see Known gaps) |
+| Aggregation Engine | `aggregation/` | ✅ Per-minute bucketing + capped player/device segments + queries, sharded per writer thread so ingest scales with worker count (memory scales with it too — see Known gaps) |
 | Time-Series Storage | `storage/` | ⚠️ Nested Y/M/D/H/Minute store, O(1) point lookup, thread-safe — but unordered and unbounded, so range queries and memory grow with uptime |
 | REST API | `query/` | ✅ `MetricsApi` + `QueryServer` (CORS) on a second port |
 | Persistence | `persistence/` | ✅ Durable metrics snapshot + validated restore |
@@ -32,21 +32,21 @@ Full design: [docs/PulseDB_Project_Specification.md](docs/PulseDB_Project_Specif
 Being explicit about what this does *not* do yet, because the modules above
 being green does not make it production-ready:
 
-- **Ingestion does not scale with worker count.** `AggregationEngine::process()`
-  takes three global mutexes per event — the time-series store's and one per
-  segment map — even on the common path where the bucket already exists.
-  Measured on 16 cores: **3.9M events/s on one thread, 1.9M on eight (0.49x)**.
-  Adding workers past ~2 makes ingest slower. Isolating the cause (disjoint
-  buckets to remove all cache-line sharing; then dropping to one mutex; then a
-  bare accumulator with no mutex at 27M events/s on eight threads) shows the
-  mutex costs roughly **15x** the atomic contention, so this is lock cost, not
-  false sharing. Per-worker sharded accumulators merged on read is the fix and is
-  the single most important outstanding item.
-- **Queries contend with ingestion.** Every query holds the same store mutex for
-  its whole traversal, and buckets are never evicted, so the cost grows with
-  uptime: a 15-row `/metrics/live` holds the ingest lock for ~13 ms at 30 days of
-  uptime and ~38 ms at 90 days. The dashboard issues four such queries every 2 s
-  per open tab.
+- **Shards multiply resident memory.** Ingestion now scales (see Benchmarks), but
+  the mechanism is replication: every shard keeps its own minute buckets and its
+  own player/device maps, so memory scales with shard count. The default is
+  `hardware_concurrency()` capped at **8** for exactly this reason. It also makes
+  `max_segments_per_dimension` a *per-shard* cap, so the global label ceiling is
+  `shards × 1,000`. Bounded, but higher than the number suggests, and it
+  compounds with the missing retention policy below.
+- **Queries pay a merge across shards.** Reads have to sum the same minute (and
+  the same segment name) from every shard, so a query is roughly `shards` times
+  the work it used to be, and it briefly takes each shard's mutex in turn. This
+  is the deliberate side of the trade — writes are the hot path and reads are a
+  dashboard poll — but it means read cost now grows with *both* bucket count and
+  shard count. Buckets are still never evicted, so it still grows with uptime.
+- **`recent`/`range` are still O(total buckets).** Sharding did not change the
+  nested-map traversal; see the range-query gap below.
 - **No retention policy.** Minute buckets are never evicted, so memory grows
   with uptime. Timestamps are bounded to a freshness window, which bounds how
   fast that can happen, but not the total.
@@ -302,35 +302,41 @@ single process — absolute numbers vary by hardware, the *shape* is the point:
 | --- | --- |
 | Queue push+pop, 1 thread | ~18–24M items/s (~45–55 ns/item) |
 | Queue MPMC, 1→8 producer/consumer pairs | ~4.5M → ~1.5M items/s |
-| Aggregation fold, 1 thread | ~2.5–3.0M events/s (~350–420 ns/event) |
+| Aggregation fold, 1 thread | ~4.1–4.4M events/s (~230–245 ns/event) |
+| Aggregation fold, 8 threads | ~9–13M events/s (~80–110 ns/event) |
 | Ingest validation (JSON → EventBatch) | ~190K–460K events/s, ~27–64 MB/s |
 
 Two honest observations the numbers surface:
 
-- **Aggregation does not scale, and the cause is lock cost, not false sharing.**
-  An earlier version of this section attributed the flat curve to atomic
-  cache-line contention on `MetricAccumulator`. That was wrong by roughly 15x.
-  The discriminating experiment varies sharing and synchronisation
-  independently — 400k events/thread, 16 cores:
+- **Aggregation scales with worker count, after sharding fixed a curve that ran
+  backwards.** The engine previously held one shared time-series store and two
+  shared segment maps, so `process()` took three global mutexes per event even
+  when the bucket already existed — and throughput *fell* as workers were added.
+  A discriminating experiment (varying sharing and synchronisation
+  independently) showed the mutex cost roughly **15x** the atomic contention, so
+  the fix was to take the lock off the write path rather than to pad the
+  counters: each writer thread now folds into its own shard, and reads merge.
 
-  | Scenario | 1 thread | 8 threads |
+  Same machine, same binary, back to back — 16 cores, median of three runs:
+
+  | Threads | Shared store (before) | Sharded (after) |
   | --- | --- | --- |
-  | Engine, shared buckets + segments | 3.52M/s | 1.75M/s |
-  | Engine, **disjoint** buckets + segments (no accumulator shared between threads) | 3.53M/s | 1.45M/s |
-  | Engine, disjoint buckets, **no segment labels** (1 mutex instead of 3) | **7.23M/s** | 2.30M/s |
-  | Bare shared `MetricAccumulator`, **no mutex at all** | 48.1M/s | **27.0M/s** |
+  | 1 | 4.9M/s | 4.1M/s |
+  | 2 | 3.4M/s | **7.0M/s** |
+  | 4 | 2.2M/s | **9.1M/s** |
+  | 8 | 1.7M/s | **11.0M/s** |
 
-  These are single runs, so read the **ratios between rows**, not the digits;
-  repeating the experiment moves each figure by a few percent and changes none of
-  the conclusions.
+  Read the shape, not the digits. Before, 8 workers delivered **0.35x** of one
+  worker — a pool sized to `hardware_concurrency()` ingested more slowly than a
+  single thread, which made the central producer–consumer claim false. After,
+  8 workers deliver **~2.7x** of one, and ~6.5x the old 8-thread figure.
 
-  Row 2 vs row 1: removing all cross-thread cache-line sharing does not help.
-  Row 3 vs row 2: removing two of the three mutexes doubles single-thread
-  throughput. Row 4: the pure false-sharing ceiling is 27M events/s, far above
-  what the engine reaches. The store mutex is the bottleneck. Padding
-  `MetricAccumulator` (80 bytes, ten adjacent atomics, no padding — measured) is
-  still worth doing, but only after the mutex leaves the hot path, and its
-  effect is second-order.
+  Two caveats worth stating. Single-threaded throughput is marginally **worse**
+  (~4.9M → ~4.1M/s): the thread-local shard lookup and the extra indirection are
+  not free, and at one thread there was no contention to recover. And these
+  figures are much higher than earlier revisions of this table reported for the
+  same code, because the machine was warm — which is exactly why the before/after
+  pair above was re-measured back to back rather than compared across sessions.
 - The **queue** is the spec's *Version 1* (mutex + condition_variable), and
   per-item throughput drops as producer/consumer pairs grow. This is *not*
   currently a bottleneck and the lock-free *Version 2* is not the right next

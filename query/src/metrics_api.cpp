@@ -41,6 +41,12 @@ json to_json(const processor::MetricsSnapshot& m, bool with_ratio = true) {
     j["error_count"] = m.error_count;
     j["watch_time_ms"] = m.watch_time_ms_sum;
     j["watch_time_min"] = static_cast<double>(m.watch_time_ms_sum) / 60'000.0;
+    // Every average ships with its sample count, so a consumer combining several
+    // populations (a dashboard summing minute buckets into a windowed total) can
+    // weight them. bitrate_avg_kbps was the one exposed without its denominator,
+    // which left averaging the per-bucket averages as the only option -- wrong
+    // whenever the buckets carry unequal numbers of samples, and wrong quietly.
+    j["bitrate_samples"] = m.bitrate_samples;
     j["bitrate_avg_kbps"] = m.avg_bitrate_kbps();
     return j;
 }

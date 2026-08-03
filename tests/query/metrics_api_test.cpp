@@ -2,6 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <string>
+#include <utility>
+
 #include "pulsedb/aggregation/aggregation_engine.hpp"
 #include "pulsedb/core/event.hpp"
 #include "pulsedb/storage/minute_key.hpp"
@@ -143,6 +147,66 @@ TEST(MetricsApiTest, DeviceBreakdownJson) {
     const auto j = api.by_device();
     ASSERT_EQ(j["devices"].size(), 2u);
     EXPECT_EQ(j["devices"][0]["name"], "Android");
+}
+
+// Every mean must ship with the sample count it was divided by, so a consumer
+// combining populations can weight them. bitrate_avg_kbps was exposed without
+// bitrate_samples, which left a caller no way to fold minute buckets into a
+// windowed total except by averaging the averages -- wrong whenever buckets hold
+// unequal sample counts, and wrong silently.
+TEST(MetricsApiTest, EveryAverageShipsWithItsSampleCount) {
+    AggregationEngine engine;
+    Event bitrate;
+    bitrate.type = EventType::kBitrateChange;
+    bitrate.timestamp_ms = kMinuteA;
+    bitrate.bitrate_kbps = 3000;
+    engine.process(bitrate);
+    MetricsApi api{engine};
+
+    for (const auto& population :
+         {api.overall()["totals"], api.live(10)["minutes"][0]["metrics"]}) {
+        for (const auto& [mean, samples] :
+             {std::pair{"startup_avg_ms", "startup_samples"},
+              std::pair{"buffer_avg_ms", "buffer_samples"},
+              std::pair{"bitrate_avg_kbps", "bitrate_samples"}}) {
+            EXPECT_TRUE(population.contains(mean)) << mean;
+            EXPECT_TRUE(population.contains(samples))
+                << samples << " is missing, so " << mean << " cannot be re-weighted";
+        }
+    }
+}
+
+TEST(MetricsApiTest, WeightedAverageIsReconstructibleFromBuckets) {
+    // Two minutes with very different sample counts: averaging the averages
+    // gives 2000, weighting by samples gives 1100. Only the latter is right.
+    AggregationEngine engine;
+    const auto add_bitrate = [&engine](std::int64_t ts, int kbps, int times) {
+        for (int i = 0; i < times; ++i) {
+            Event e;
+            e.type = EventType::kBitrateChange;
+            e.timestamp_ms = ts;
+            e.bitrate_kbps = kbps;
+            engine.process(e);
+        }
+    };
+    add_bitrate(kMinuteA, 1000, 9);
+    add_bitrate(kMinuteB, 10000, 1);
+
+    MetricsApi api{engine};
+    const auto minutes = api.live(10)["minutes"];
+    ASSERT_EQ(minutes.size(), 2u);
+
+    double weighted = 0.0;
+    std::uint64_t samples = 0;
+    for (const auto& point : minutes) {
+        const auto& m = point["metrics"];
+        weighted += m["bitrate_avg_kbps"].get<double>() * m["bitrate_samples"].get<double>();
+        samples += m["bitrate_samples"].get<std::uint64_t>();
+    }
+    ASSERT_EQ(samples, 10u);
+    EXPECT_DOUBLE_EQ(weighted / static_cast<double>(samples),
+                     api.overall()["totals"]["bitrate_avg_kbps"].get<double>())
+        << "re-weighting the buckets must reproduce the platform-wide mean";
 }
 
 }  // namespace

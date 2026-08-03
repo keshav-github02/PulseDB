@@ -18,6 +18,9 @@ export interface Metrics {
   error_count: number
   watch_time_ms: number
   watch_time_min: number
+  /// Denominator of bitrate_avg_kbps. Present so buckets can be folded into a
+  /// windowed total with the mean correctly re-weighted.
+  bitrate_samples: number
   bitrate_avg_kbps: number
 }
 

@@ -7,7 +7,16 @@ export interface PollResult<T> {
 
 /// Poll @p fetcher every @p intervalMs, exposing the latest data or the
 /// most recent error. Fetches once immediately on mount.
-export function usePolling<T>(fetcher: () => Promise<T>, intervalMs: number): PollResult<T> {
+/// @param resetKey change this to restart polling immediately rather than at the
+///        next tick. Switching the time range changes what `fetcher` asks for,
+///        and without a restart the panel would keep showing the previous
+///        window's data until the interval next elapsed -- up to ten seconds on
+///        the widest range, which reads as the control having done nothing.
+export function usePolling<T>(
+  fetcher: () => Promise<T>,
+  intervalMs: number,
+  resetKey?: unknown,
+): PollResult<T> {
   const [data, setData] = useState<T | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -58,7 +67,7 @@ export function usePolling<T>(fetcher: () => Promise<T>, intervalMs: number): Po
       active = false
       window.clearInterval(id)
     }
-  }, [intervalMs])
+  }, [intervalMs, resetKey])
 
   return { data, error }
 }

@@ -39,16 +39,35 @@ constexpr std::int64_t sub_sat(std::int64_t a, std::int64_t b) {
     return a - b;
 }
 
-/// Deepest bracket nesting in @p body, counting only structural brackets
-/// (those outside string literals).
+/// What a lexical pre-scan can tell us about a body before it is parsed.
+struct BodyShape {
+    std::size_t deepest = 0;           ///< Deepest bracket nesting.
+    bool over_token_budget = false;    ///< Scan aborted: too many structural tokens.
+};
+
+/// Measure @p body's nesting depth and structural token count without parsing it.
 ///
-/// This is a lexical pre-scan rather than a check on the parsed document
-/// because it has to run *before* json::parse: nlohmann's parser is iterative
-/// and survives extreme nesting, but it still allocates one node per level, so
-/// the DOM is what needs bounding, and by then it is too late.
-std::size_t max_nesting_depth(std::string_view body) {
+/// Both bounds have to be established *before* json::parse, because the DOM is
+/// the resource being protected and by the time parse returns it has already
+/// been built. nlohmann's parser is iterative, so it survives hostile input --
+/// it just allocates while doing so.
+///
+/// Depth bounds nesting. The token count bounds *breadth*, which depth cannot:
+/// a flat array is depth 1 no matter how long it is. max_events_per_batch was
+/// supposed to bound that, but it is only knowable after parsing, so the entire
+/// cost was paid before the check that rejects it. Measured: an 8 MiB body of
+/// `[0,0,0,...]` (4.2M elements, depth 1) occupied a request thread for **6.66
+/// seconds** and was then answered 422 -- against 0.64s for a legitimate 9,000
+/// event batch. httplib serves one thread per connection from a fixed pool, so a
+/// handful of concurrent such requests starves ingestion of every thread it has,
+/// at a cost to the sender of nothing but bandwidth.
+///
+/// The scan aborts the moment the budget is exceeded, so a hostile body is not
+/// even fully walked.
+BodyShape scan_structure(std::string_view body, std::size_t token_budget) {
+    BodyShape shape;
     std::size_t depth = 0;
-    std::size_t deepest = 0;
+    std::size_t tokens = 0;
     bool in_string = false;
     bool escaped = false;
 
@@ -69,19 +88,28 @@ std::size_t max_nesting_depth(std::string_view body) {
                 break;
             case '[':
             case '{':
-                deepest = std::max(deepest, ++depth);
+                shape.deepest = std::max(shape.deepest, ++depth);
+                ++tokens;
                 break;
             case ']':
             case '}':
                 if (depth > 0) {
                     --depth;
                 }
+                ++tokens;
+                break;
+            case ',':
+                ++tokens;
                 break;
             default:
                 break;
         }
+        if (tokens > token_budget) {
+            shape.over_token_budget = true;
+            return shape;
+        }
     }
-    return deepest;
+    return shape;
 }
 
 }  // namespace
@@ -96,10 +124,19 @@ IngestResult IngestHandler::handle(std::string_view body,
                       "request body exceeds max_body_bytes (" +
                           std::to_string(options_.max_body_bytes) + ")");
     }
-    if (const std::size_t depth = max_nesting_depth(body);
-        depth > options_.max_json_depth) {
+    const BodyShape shape = scan_structure(body, options_.max_structural_tokens);
+    if (shape.over_token_budget) {
         return reject(IngestStatus::kInvalidSchema,
-                      "request body nests " + std::to_string(depth) +
+                      "request body exceeds max_structural_tokens (" +
+                          std::to_string(options_.max_structural_tokens) +
+                          "); it encodes far more JSON values than "
+                          "max_events_per_batch (" +
+                          std::to_string(options_.max_events_per_batch) +
+                          ") events could contain");
+    }
+    if (shape.deepest > options_.max_json_depth) {
+        return reject(IngestStatus::kInvalidSchema,
+                      "request body nests " + std::to_string(shape.deepest) +
                           " levels deep, exceeding max_json_depth (" +
                           std::to_string(options_.max_json_depth) + ")");
     }

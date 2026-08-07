@@ -296,6 +296,85 @@ TEST(IngestHandlerTest, IgnoresNumericFieldsIrrelevantToTheEventType) {
               IngestStatus::kAccepted);
 }
 
+// --- Breadth bound (parse-cost DoS) -----------------------------------------
+// max_events_per_batch is only knowable after json::parse has built the DOM, so
+// it could not bound parsing cost -- the work was already done by the time it
+// rejected the batch. max_json_depth did not help either: a flat array is depth
+// 1 however long it grows. Measured before the fix, an 8 MiB body of
+// "[0,0,0,...]" (4.2M elements) held a request thread for 6.66 seconds and was
+// then answered 422, against 0.64s for a legitimate 9,000-event batch.
+
+TEST(IngestHandlerTest, RejectsAFlatBodyWithTooManyValuesBeforeParsing) {
+    // Depth 1, so the nesting guard passes it; breadth is the whole attack.
+    std::string body = "[0";
+    for (int i = 0; i < 50'000; ++i) {
+        body += ",0";
+    }
+    body += "]";
+
+    IngestOptions opts;
+    opts.max_structural_tokens = 1'000;
+    const auto r = run(body, opts);
+    EXPECT_EQ(r.status, IngestStatus::kInvalidSchema);
+    EXPECT_NE(r.message.find("max_structural_tokens"), std::string::npos) << r.message;
+}
+
+TEST(IngestHandlerTest, BreadthBoundIsCheckedBeforeTheEventCount) {
+    // Both limits would reject this body. The breadth bound has to be the one
+    // that fires, because it is the only one that runs before the parse.
+    // Sized past max_structural_tokens, not merely past max_events_per_batch --
+    // 50k elements clears the event cap but sits well inside the token budget,
+    // so it would prove nothing about which guard ran first.
+    IngestOptions opts;
+    std::string body = "[0";
+    for (std::size_t i = 0; i < opts.max_structural_tokens + 1'000; ++i) {
+        body += ",0";
+    }
+    body += "]";
+
+    const auto r = run(body);
+    EXPECT_EQ(r.status, IngestStatus::kInvalidSchema);
+    EXPECT_NE(r.message.find("max_structural_tokens"), std::string::npos)
+        << "the pre-parse guard must fire, not the post-parse event count: " << r.message;
+}
+
+TEST(IngestHandlerTest, AFullSizeLegitimateBatchStillFitsTheBreadthBound) {
+    // The guard is worthless if it rejects real traffic. A maximum-size batch of
+    // realistic events must pass with room to spare under the default.
+    //
+    // No "timestamp" field: an absent one is stamped with the receipt time, so
+    // this cannot rot. A literal epoch would drift out of the max_lateness
+    // freshness window as the calendar moves and fail months from now for a
+    // reason that has nothing to do with what is being tested.
+    IngestOptions opts;
+    std::string body = "[";
+    for (std::size_t i = 0; i < opts.max_events_per_batch; ++i) {
+        if (i > 0) {
+            body += ',';
+        }
+        body +=
+            R"({"event_type":"startup_complete","session_id":"abcdef0123456789",)"
+            R"("player":"ExoPlayer","device":"Android","startup_time_ms":1800})";
+    }
+    body += "]";
+    ASSERT_LE(body.size(), opts.max_body_bytes) << "test batch must fit the byte cap";
+
+    const auto r = run(body);
+    EXPECT_EQ(r.status, IngestStatus::kAccepted) << r.message;
+    ASSERT_TRUE(r.batch.has_value());
+    EXPECT_EQ(r.batch->size(), opts.max_events_per_batch);
+}
+
+TEST(IngestHandlerTest, CommasInsideStringsDoNotCountTowardBreadth) {
+    // The scan must ignore structural characters inside string literals, or a
+    // legitimate label full of commas would be read as thousands of values.
+    IngestOptions opts;
+    opts.max_structural_tokens = 20;
+    const auto r = run(
+        R"([{"event_type":"seek","session_id":"a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p"}])", opts);
+    EXPECT_EQ(r.status, IngestStatus::kAccepted) << r.message;
+}
+
 // --- Event-type whitelist ---------------------------------------------------
 // Presence used to be the entire check, so an unrecognised type was answered
 // with 202 and then dropped by the worker as a parse failure: the client was

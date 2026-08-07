@@ -42,7 +42,32 @@ struct IngestOptions {
     std::size_t max_json_depth = 32;
 
     /// Batches with more events than this are rejected (bounds fan-out).
+    ///
+    /// Note this cannot bound *parsing* cost: the count is only knowable once
+    /// json::parse has built the DOM, so by the time it rejects a batch the work
+    /// has already been done. max_structural_tokens is what guards that.
     std::size_t max_events_per_batch = 10'000;
+
+    /// Maximum JSON structural tokens (`{` `}` `[` `]` `,` outside strings) in a
+    /// body, counted by a lexical pre-scan before any parsing happens.
+    ///
+    /// max_json_depth bounds how deeply a body nests; this bounds how *broad* it
+    /// is, which depth cannot see -- a flat array is depth 1 however long it
+    /// grows. Without it, `max_body_bytes` was the only real limit on parse cost,
+    /// and 8 MiB of JSON encodes far more values than any legitimate batch:
+    /// `[0,0,0,...]` reaches 4.2M elements, held a request thread for **6.66
+    /// seconds**, and was only then rejected for exceeding
+    /// max_events_per_batch. A legitimate 9,000-event batch parses in 0.64s.
+    /// httplib serves one thread per connection from a fixed pool, so a few
+    /// concurrent such requests starve ingestion of every thread it has -- and
+    /// cost the sender only bandwidth.
+    ///
+    /// The default is deliberately generous: a full 10,000-event batch of
+    /// realistic events measures around 70,000 tokens, so this leaves several
+    /// times the headroom a real client needs while cutting the worst case from
+    /// seconds to well under one. The scan stops as soon as the budget is
+    /// exceeded, so an oversized body is not even walked to the end.
+    std::size_t max_structural_tokens = 250'000;
 
     /// How far in the past and future an event's own "timestamp" may sit,
     /// relative to the moment we received it.
